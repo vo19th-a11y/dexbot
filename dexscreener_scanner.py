@@ -25,6 +25,7 @@ Environment variables (set these in the Render dashboard):
 
 import json
 import os
+import html
 import re
 import threading
 import time
@@ -44,7 +45,7 @@ KEYWORDS = [
 ]
 
 # A token must clear this 24h volume (in USD) to trigger an alert.
-MIN_VOLUME_USD = 400_000
+MIN_VOLUME_USD = 40_000
 
 # Optional market-cap floor. Set to 0 to disable (market cap is still shown).
 MIN_MARKET_CAP_USD = 0
@@ -81,15 +82,18 @@ STATUS = {"started": None, "last_scan": None, "matches": 0, "checked": 0}
 # --------------------------- ALERT CHANNELS --------------------------------
 
 
-def send_telegram(text: str) -> None:
+def send_telegram(text: str, parse_mode: str = None) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not (token and chat_id):
         return
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": False}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": False},
+            json=payload,
             timeout=10,
         )
     except requests.RequestException as e:
@@ -134,26 +138,44 @@ def alert(profile: dict, matched: list, volume: float, market_cap, created_at_ms
     chain = profile.get("chainId", "?")
     addr = profile.get("tokenAddress", "?")
     url = profile.get("url") or f"https://dexscreener.com/{chain}/{addr}"
-    desc = (profile.get("description") or "").strip()
+    desc = (profile.get("description") or "").strip()[:400]
     mcap_str = f"${market_cap:,.0f}" if market_cap is not None else "n/a"
 
     age_h = hours_since(created_at_ms)
     is_new = age_h is not None and age_h <= NEW_LAUNCH_HOURS
     header = "\U0001F195 NEW LAUNCH" if is_new else "\U0001F6A8 Match"
 
-    msg = (
+    # Plain text for the console log.
+    plain = (
         f"{header} on {chain.upper()}\n"
         f"Keywords: {', '.join(matched)}\n"
         f"Age: {format_age(created_at_ms)}\n"
         f"24h Volume: ${volume:,.0f}\n"
         f"Market Cap: {mcap_str}\n"
         f"Token: {addr}\n"
-        f"Summary: {desc[:400]}\n"
+        f"Summary: {desc}\n"
         f"{url}"
     )
-    print("\n" + msg + "\n", flush=True)
-    send_telegram(msg)
-    send_discord(msg)
+    print("\n" + plain + "\n", flush=True)
+
+    # Telegram: wrap the address in <code> so tapping it copies to clipboard.
+    e = html.escape
+    telegram_msg = (
+        f"{header} on {e(chain.upper())}\n"
+        f"Keywords: {e(', '.join(matched))}\n"
+        f"Age: {e(format_age(created_at_ms))}\n"
+        f"24h Volume: ${volume:,.0f}\n"
+        f"Market Cap: {e(mcap_str)}\n"
+        f"Token (tap to copy): <code>{e(addr)}</code>\n"
+        f"Summary: {e(desc)}\n"
+        f"{e(url)}"
+    )
+    send_telegram(telegram_msg, parse_mode="HTML")
+
+    # Discord: backticks render the address as monospace for easy copying.
+    discord_msg = plain.replace(f"Token: {addr}", f"Token: `{addr}`")
+    send_discord(discord_msg)
+
     STATUS["matches"] += 1
 
 
