@@ -45,10 +45,10 @@ KEYWORDS = [
 ]
 
 # A token must clear this 24h volume (in USD) to trigger an alert.
-MIN_VOLUME_USD = 40_000
+MIN_VOLUME_USD = 15_000
 
 # Optional market-cap floor. Set to 0 to disable (market cap is still shown).
-MIN_MARKET_CAP_USD = 0
+MIN_MARKET_CAP_USD = 10_000
 
 # Market-cap ceiling: tokens ABOVE this are skipped. Set to 0 to disable.
 MAX_MARKET_CAP_USD = 5_000_000
