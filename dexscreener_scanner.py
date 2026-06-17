@@ -5,6 +5,7 @@ DexScreener new-launch keyword scanner — Render free-tier edition.
 Scans the DexScreener token-profiles feed (the part of a token page holding its
 summary/description). Alerts when a token on ETH / SOL / BASE / BSC has a
 summary containing a target keyword AND a 24h volume above a minimum threshold.
+Each alert also reports the token's market cap.
 
 It also runs a tiny web server so it qualifies as a free Render "web service".
 A keep-alive pinger hitting the URL every few minutes stops Render sleeping it.
@@ -12,7 +13,7 @@ A keep-alive pinger hitting the URL every few minutes stops Render sleeping it.
 Public endpoints used (no API key required):
   https://api.dexscreener.com/token-profiles/latest/v1        (~60 req/min)
   https://api.dexscreener.com/token-profiles/recent-updates/v1
-  https://api.dexscreener.com/latest/dex/tokens/{address}     (volume lookup)
+  https://api.dexscreener.com/latest/dex/tokens/{address}     (volume + mcap)
 
 Environment variables (set these in the Render dashboard):
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   -> sends Telegram messages
@@ -41,7 +42,13 @@ KEYWORDS = [
 ]
 
 # A token must clear this 24h volume (in USD) to trigger an alert.
-MIN_VOLUME_USD = 40_000
+MIN_VOLUME_USD = 400_000
+
+# Optional market-cap floor. Set to 0 to disable (market cap is still shown).
+MIN_MARKET_CAP_USD = 0
+
+# Market-cap ceiling: tokens ABOVE this are skipped. Set to 0 to disable.
+MAX_MARKET_CAP_USD = 5_000_000
 
 # Require ALL keywords (True) or ANY one of them (False).
 REQUIRE_ALL_KEYWORDS = False
@@ -90,16 +97,18 @@ def send_discord(text: str) -> None:
         print(f"[warn] discord send failed: {e}", flush=True)
 
 
-def alert(profile: dict, matched: list, volume: float) -> None:
+def alert(profile: dict, matched: list, volume: float, market_cap) -> None:
     chain = profile.get("chainId", "?")
     addr = profile.get("tokenAddress", "?")
     url = profile.get("url") or f"https://dexscreener.com/{chain}/{addr}"
     desc = (profile.get("description") or "").strip()
+    mcap_str = f"${market_cap:,.0f}" if market_cap is not None else "n/a"
 
     msg = (
         f"\U0001F6A8 Match on {chain.upper()}\n"
         f"Keywords: {', '.join(matched)}\n"
         f"24h Volume: ${volume:,.0f}\n"
+        f"Market Cap: {mcap_str}\n"
         f"Token: {addr}\n"
         f"Summary: {desc[:400]}\n"
         f"{url}"
@@ -137,22 +146,31 @@ def matched_keywords(description: str) -> list:
     return hits
 
 
-def get_volume_usd(token_address: str):
-    """Return the highest 24h volume across the token's pairs, or None on error."""
+def get_token_metrics(token_address: str):
+    """Return (volume_24h, market_cap) from the token's top pair, or None on error.
+
+    market_cap may be None if DexScreener doesn't report it for that token.
+    """
     try:
         resp = requests.get(
             TOKEN_ENDPOINT.format(address=token_address), headers=HEADERS, timeout=15
         )
         if resp.status_code == 429:
-            print("[warn] rate limited (429) on volume lookup, backing off", flush=True)
+            print("[warn] rate limited (429) on metrics lookup, backing off", flush=True)
             time.sleep(60)
             return None
         resp.raise_for_status()
         pairs = resp.json().get("pairs") or []
-        vols = [float((p.get("volume") or {}).get("h24") or 0) for p in pairs]
-        return max(vols) if vols else 0.0
+        if not pairs:
+            return (0.0, None)
+        # Use the pair with the highest 24h volume as the token's primary market.
+        best = max(pairs, key=lambda p: float((p.get("volume") or {}).get("h24") or 0))
+        volume = float((best.get("volume") or {}).get("h24") or 0)
+        raw_mcap = best.get("marketCap")
+        market_cap = float(raw_mcap) if raw_mcap is not None else None
+        return (volume, market_cap)
     except (requests.RequestException, ValueError) as e:
-        print(f"[warn] volume lookup failed for {token_address}: {e}", flush=True)
+        print(f"[warn] metrics lookup failed for {token_address}: {e}", flush=True)
         return None
 
 
@@ -190,13 +208,19 @@ def scan_once(seen: set) -> None:
             if not hits:
                 continue  # keyword miss; not marked seen, cheap to re-check
 
-            volume = get_volume_usd(p.get("tokenAddress", ""))
-            if volume is None:
+            metrics = get_token_metrics(p.get("tokenAddress", ""))
+            if metrics is None:
                 continue  # lookup failed; retry next cycle
-            if volume < MIN_VOLUME_USD:
-                continue  # below floor; re-check later as volume may grow
+            volume, market_cap = metrics
 
-            alert(p, hits, volume)
+            if volume < MIN_VOLUME_USD:
+                continue  # below volume floor; re-check later as volume may grow
+            if MIN_MARKET_CAP_USD and (market_cap is None or market_cap < MIN_MARKET_CAP_USD):
+                continue  # below market-cap floor
+            if MAX_MARKET_CAP_USD and (market_cap is None or market_cap > MAX_MARKET_CAP_USD):
+                continue  # above ceiling (unknown market cap is also skipped)
+
+            alert(p, hits, volume, market_cap)
             seen.add(key)  # only mark seen once it has actually alerted
 
     STATUS["last_scan"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
