@@ -4,8 +4,10 @@ DexScreener new-launch keyword scanner — Render free-tier edition.
 
 Scans the DexScreener token-profiles feed (the part of a token page holding its
 summary/description). Alerts when a token on ETH / SOL / BASE / BSC has a
-summary containing a target keyword AND a 24h volume above a minimum threshold.
-Each alert also reports the token's market cap.
+summary containing a target keyword AND clears the volume / market-cap filters.
+New launches are prioritised: alerts are sorted newest-first and very fresh
+tokens are flagged with a NEW LAUNCH marker. Each alert reports volume, market
+cap and launch age.
 
 It also runs a tiny web server so it qualifies as a free Render "web service".
 A keep-alive pinger hitting the URL every few minutes stops Render sleeping it.
@@ -13,7 +15,7 @@ A keep-alive pinger hitting the URL every few minutes stops Render sleeping it.
 Public endpoints used (no API key required):
   https://api.dexscreener.com/token-profiles/latest/v1        (~60 req/min)
   https://api.dexscreener.com/token-profiles/recent-updates/v1
-  https://api.dexscreener.com/latest/dex/tokens/{address}     (volume + mcap)
+  https://api.dexscreener.com/latest/dex/tokens/{address}     (vol + mcap + age)
 
 Environment variables (set these in the Render dashboard):
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   -> sends Telegram messages
@@ -49,6 +51,13 @@ MIN_MARKET_CAP_USD = 0
 
 # Market-cap ceiling: tokens ABOVE this are skipped. Set to 0 to disable.
 MAX_MARKET_CAP_USD = 5_000_000
+
+# Only alert on launches younger than this many hours. Set to 0 to disable
+# (when disabled, older tokens still alert but are sorted below newer ones).
+MAX_AGE_HOURS = 0
+
+# Tokens younger than this get a "NEW LAUNCH" tag and sort to the top.
+NEW_LAUNCH_HOURS = 24
 
 # Require ALL keywords (True) or ANY one of them (False).
 REQUIRE_ALL_KEYWORDS = False
@@ -97,16 +106,45 @@ def send_discord(text: str) -> None:
         print(f"[warn] discord send failed: {e}", flush=True)
 
 
-def alert(profile: dict, matched: list, volume: float, market_cap) -> None:
+def hours_since(created_at_ms):
+    if not created_at_ms:
+        return None
+    delta = datetime.now(timezone.utc) - datetime.fromtimestamp(
+        created_at_ms / 1000, timezone.utc
+    )
+    return max(delta.total_seconds() / 3600, 0)
+
+
+def format_age(created_at_ms) -> str:
+    h = hours_since(created_at_ms)
+    if h is None:
+        return "unknown"
+    secs = int(h * 3600)
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, _ = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def alert(profile: dict, matched: list, volume: float, market_cap, created_at_ms) -> None:
     chain = profile.get("chainId", "?")
     addr = profile.get("tokenAddress", "?")
     url = profile.get("url") or f"https://dexscreener.com/{chain}/{addr}"
     desc = (profile.get("description") or "").strip()
     mcap_str = f"${market_cap:,.0f}" if market_cap is not None else "n/a"
 
+    age_h = hours_since(created_at_ms)
+    is_new = age_h is not None and age_h <= NEW_LAUNCH_HOURS
+    header = "\U0001F195 NEW LAUNCH" if is_new else "\U0001F6A8 Match"
+
     msg = (
-        f"\U0001F6A8 Match on {chain.upper()}\n"
+        f"{header} on {chain.upper()}\n"
         f"Keywords: {', '.join(matched)}\n"
+        f"Age: {format_age(created_at_ms)}\n"
         f"24h Volume: ${volume:,.0f}\n"
         f"Market Cap: {mcap_str}\n"
         f"Token: {addr}\n"
@@ -147,9 +185,8 @@ def matched_keywords(description: str) -> list:
 
 
 def get_token_metrics(token_address: str):
-    """Return (volume_24h, market_cap) from the token's top pair, or None on error.
-
-    market_cap may be None if DexScreener doesn't report it for that token.
+    """Return (volume_24h, market_cap, pair_created_at_ms) from the token's top
+    pair, or None on error. market_cap / created_at may be None if not reported.
     """
     try:
         resp = requests.get(
@@ -162,13 +199,14 @@ def get_token_metrics(token_address: str):
         resp.raise_for_status()
         pairs = resp.json().get("pairs") or []
         if not pairs:
-            return (0.0, None)
+            return (0.0, None, None)
         # Use the pair with the highest 24h volume as the token's primary market.
         best = max(pairs, key=lambda p: float((p.get("volume") or {}).get("h24") or 0))
         volume = float((best.get("volume") or {}).get("h24") or 0)
         raw_mcap = best.get("marketCap")
         market_cap = float(raw_mcap) if raw_mcap is not None else None
-        return (volume, market_cap)
+        created_at = best.get("pairCreatedAt")  # ms since epoch, or absent
+        return (volume, market_cap, created_at)
     except (requests.RequestException, ValueError) as e:
         print(f"[warn] metrics lookup failed for {token_address}: {e}", flush=True)
         return None
@@ -188,6 +226,9 @@ def fetch_profiles(endpoint: str) -> list:
 
 
 def scan_once(seen: set) -> None:
+    candidates = []  # collected this cycle, then sorted newest-first before alerting
+    queued = set()   # avoid double-processing a token that appears in both feeds
+
     for endpoint in PROFILE_ENDPOINTS:
         try:
             profiles = fetch_profiles(endpoint)
@@ -200,8 +241,8 @@ def scan_once(seen: set) -> None:
                 continue
 
             key = f"{p.get('chainId')}:{p.get('tokenAddress')}"
-            if key in seen:
-                continue  # already alerted on this one
+            if key in seen or key in queued:
+                continue
 
             hits = matched_keywords(p.get("description", ""))
             STATUS["checked"] += 1
@@ -211,17 +252,29 @@ def scan_once(seen: set) -> None:
             metrics = get_token_metrics(p.get("tokenAddress", ""))
             if metrics is None:
                 continue  # lookup failed; retry next cycle
-            volume, market_cap = metrics
+            volume, market_cap, created_at = metrics
 
             if volume < MIN_VOLUME_USD:
                 continue  # below volume floor; re-check later as volume may grow
             if MIN_MARKET_CAP_USD and (market_cap is None or market_cap < MIN_MARKET_CAP_USD):
                 continue  # below market-cap floor
             if MAX_MARKET_CAP_USD and (market_cap is None or market_cap > MAX_MARKET_CAP_USD):
-                continue  # above ceiling (unknown market cap is also skipped)
+                continue  # above market-cap ceiling (unknown market cap also skipped)
 
-            alert(p, hits, volume, market_cap)
-            seen.add(key)  # only mark seen once it has actually alerted
+            age_h = hours_since(created_at)
+            if MAX_AGE_HOURS and (age_h is None or age_h > MAX_AGE_HOURS):
+                continue  # too old (or unknown age) for the new-launch window
+
+            # sort key: newer launches first; unknown age sorts last
+            sort_age = age_h if age_h is not None else float("inf")
+            candidates.append((sort_age, key, p, hits, volume, market_cap, created_at))
+            queued.add(key)
+
+    # Prioritise new launches: youngest first.
+    candidates.sort(key=lambda c: c[0])
+    for _, key, p, hits, volume, market_cap, created_at in candidates:
+        alert(p, hits, volume, market_cap, created_at)
+        seen.add(key)  # only mark seen once it has actually alerted
 
     STATUS["last_scan"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -231,7 +284,8 @@ def scanner_loop() -> None:
     STATUS["started"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print(
         f"Scanning {', '.join(sorted(CHAINS))} for words {KEYWORDS} "
-        f"(min 24h vol ${MIN_VOLUME_USD:,}) every {POLL_SECONDS}s.",
+        f"(min 24h vol ${MIN_VOLUME_USD:,}, max mcap ${MAX_MARKET_CAP_USD:,}) "
+        f"every {POLL_SECONDS}s. New launches prioritised.",
         flush=True,
     )
     while True:
