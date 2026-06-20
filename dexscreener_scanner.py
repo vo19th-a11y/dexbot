@@ -36,10 +36,25 @@ import requests
 
 # ------------------------- FIXED SETTINGS ----------------------------------
 
-CHAINS = {"ethereum", "solana", "base", "bsc"}
 POLL_SECONDS = 30
 SEEN_FILE = "seen_tokens.json"
 SETTINGS_FILE = "settings.json"
+
+# Friendly names -> the exact DexScreener chainId. Anything not listed is used
+# as-is (lowercased), so any valid DexScreener chainId still works.
+CHAIN_ALIASES = {
+    "eth": "ethereum", "ethereum": "ethereum",
+    "sol": "solana", "solana": "solana",
+    "base": "base",
+    "bsc": "bsc", "bnb": "bsc", "binance": "bsc",
+    "tron": "tron", "trx": "tron",
+    "sui": "sui",
+    "ton": "ton", "gram": "ton",
+    "arb": "arbitrum", "arbitrum": "arbitrum",
+    "matic": "polygon", "polygon": "polygon",
+    "avax": "avalanche", "avalanche": "avalanche",
+    "op": "optimism", "optimism": "optimism",
+}
 
 # ------------------------- TUNABLE SETTINGS --------------------------------
 # These defaults can be changed live from Telegram (see /help). Edits made via
@@ -47,6 +62,7 @@ SETTINGS_FILE = "settings.json"
 # is wiped on every redeploy, so it falls back to these defaults after a deploy.
 
 DEFAULTS = {
+    "chains": ["ethereum", "solana", "base", "bsc", "tron", "sui", "ton"],
     "keywords": ["first", "new"],     # whole-word, case-insensitive
     "require_all_keywords": False,    # True = must contain every keyword
     "min_volume_usd": 15_000,         # 24h volume floor
@@ -56,6 +72,11 @@ DEFAULTS = {
     "new_launch_hours": 24,           # younger than this gets a NEW LAUNCH tag
 }
 CONFIG = dict(DEFAULTS)
+
+
+def normalize_chain(token: str) -> str:
+    t = token.strip().lower()
+    return CHAIN_ALIASES.get(t, t)
 
 PROFILE_ENDPOINTS = [
     "https://api.dexscreener.com/token-profiles/latest/v1",
@@ -263,7 +284,7 @@ def scan_once(seen: set) -> None:
             continue
 
         for p in profiles:
-            if p.get("chainId") not in CHAINS:
+            if p.get("chainId") not in CONFIG["chains"]:
                 continue
 
             key = f"{p.get('chainId')}:{p.get('tokenAddress')}"
@@ -341,7 +362,7 @@ def format_settings() -> str:
     maxmc = f"${c['max_market_cap_usd']:,}" if c["max_market_cap_usd"] else "off"
     return (
         "Current criteria:\n"
-        f"- Chains: {', '.join(sorted(CHAINS))}\n"
+        f"- Chains: {', '.join(CONFIG['chains'])}\n"
         f"- Keywords: {', '.join(c['keywords'])} "
         f"({'ALL' if c['require_all_keywords'] else 'ANY'})\n"
         f"- Min 24h volume: ${c['min_volume_usd']:,}\n"
@@ -352,16 +373,38 @@ def format_settings() -> str:
 
 
 HELP_TEXT = (
-    "Commands:\n"
-    "/status - show current criteria\n"
-    "/minvol 15k - set min 24h volume\n"
-    "/minmcap 10k - set market-cap floor (0 = off)\n"
-    "/maxmcap 5m - set market-cap ceiling (0 = off)\n"
+    "🤖 DexScreener Scanner — what you can do\n"
+    "Send any command below to change the bot live. No code or redeploy needed.\n"
+    "Values accept 15000, 15k, 1.5m, or $40,000.\n"
+    "\n"
+    "📊 VIEW\n"
+    "/status - show all current criteria\n"
+    "/help - this message\n"
+    "\n"
+    "💧 VOLUME & MARKET CAP\n"
+    "/minvol 15k - minimum 24h volume to alert\n"
+    "/minmcap 10k - market-cap floor (0 = off)\n"
+    "/maxmcap 5m - market-cap ceiling (0 = off)\n"
+    "\n"
+    "🆕 AGE / NEW LAUNCHES\n"
     "/maxage 72 - only alert tokens younger than N hours (0 = off)\n"
-    "/newlaunch 24 - NEW LAUNCH tag under N hours\n"
-    "/keywords first,new - set keywords (comma separated)\n"
-    "/requireall on - require ALL keywords (on/off)\n"
-    "/help - this message"
+    "/newlaunch 24 - tag tokens younger than N hours as NEW LAUNCH\n"
+    "\n"
+    "🔤 KEYWORDS (matched in the token summary)\n"
+    "/keywords first,new - set the words to look for\n"
+    "/requireall on - need ALL keywords (on) or ANY one (off)\n"
+    "\n"
+    "⛓️ CHAINS\n"
+    "/chains - show active chains\n"
+    "/chains add tron - add chain(s)\n"
+    "/chains remove ton - remove chain(s)\n"
+    "/chains set eth,sol,base - replace the whole list\n"
+    "Names like eth, bnb, arb, gram are understood automatically.\n"
+    "\n"
+    "ℹ️ Notes\n"
+    "- A token must pass EVERY active filter to alert.\n"
+    "- Each token alerts once; tap the address to copy it.\n"
+    "- On Render's free tier, a redeploy resets these to defaults."
 )
 
 
@@ -391,6 +434,27 @@ def handle_command(text: str) -> str:
             if not kws:
                 return "Give at least one keyword, e.g. /keywords first,new"
             CONFIG["keywords"] = kws
+        elif cmd == "chains":
+            tokens = parts[1:]
+            if not tokens:
+                return format_settings() + "\n\nChange with: /chains add tron | /chains remove ton | /chains set eth,sol,base"
+            sub = tokens[0].lower()
+            if sub in ("add", "remove", "set"):
+                items = [normalize_chain(t) for t in " ".join(tokens[1:]).replace(",", " ").split() if t.strip()]
+            else:
+                sub, items = "set", [normalize_chain(t) for t in " ".join(tokens).replace(",", " ").split() if t.strip()]
+            if not items:
+                return "Give at least one chain, e.g. /chains add tron"
+            cur = list(CONFIG["chains"])
+            if sub == "set":
+                cur = items
+            elif sub == "add":
+                cur += [c for c in items if c not in cur]
+            elif sub == "remove":
+                cur = [c for c in cur if c not in items]
+            if not cur:
+                return "At least one chain must stay active."
+            CONFIG["chains"] = cur
         elif cmd == "requireall":
             CONFIG["require_all_keywords"] = arg.lower() in ("on", "true", "yes", "1")
         else:
@@ -446,6 +510,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_HEAD(self):
+        # UptimeRobot (and some monitors) send HEAD, not GET. Answer 200.
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
 
     def log_message(self, *args):
         pass
