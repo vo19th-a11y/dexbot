@@ -199,22 +199,6 @@ def format_age(created_at_ms) -> str:
     return f"{mins}m"
 
 
-EXPLORERS = {
-    "ethereum": "https://etherscan.io/token/{a}",
-    "solana": "https://solscan.io/token/{a}",
-    "base": "https://basescan.org/token/{a}",
-    "bsc": "https://bscscan.com/token/{a}",
-    "tron": "https://tronscan.org/#/token20/{a}",
-    "sui": "https://suiscan.xyz/mainnet/coin/{a}",
-    "ton": "https://tonviewer.com/{a}",
-}
-
-
-def explorer_url(chain, addr):
-    tmpl = EXPLORERS.get(chain)
-    return tmpl.format(a=addr) if tmpl else None
-
-
 TYPE_NAMES = {
     "twitter": "X", "x": "X", "telegram": "Telegram", "discord": "Discord",
     "youtube": "YouTube", "instagram": "Instagram", "reddit": "Reddit",
@@ -264,10 +248,10 @@ def social_lines(profile):
     return out
 
 
-def alert(profile: dict, matched: list, volume: float, market_cap, created_at_ms) -> None:
+def alert(profile: dict, matched: list, volume: float, market_cap, created_at_ms, pair_url=None) -> None:
     chain = profile.get("chainId", "?")
     addr = profile.get("tokenAddress", "?")
-    url = profile.get("url") or f"https://dexscreener.com/{chain}/{addr}"
+    url = pair_url or profile.get("url") or f"https://dexscreener.com/{chain}/{addr}"
     desc = (profile.get("description") or "").strip()[:300]
     mcap_str = f"${market_cap:,.0f}" if market_cap is not None else "n/a"
 
@@ -277,8 +261,6 @@ def alert(profile: dict, matched: list, volume: float, market_cap, created_at_ms
 
     links = social_lines(profile)
     links_plain = "".join(f"{name}: {u}\n" for name, u in links)
-    explorer = explorer_url(chain, addr)
-    explorer_plain = f"Explorer: {explorer}\n" if explorer else ""
 
     plain = (
         f"{header} on {chain.upper()}\n"
@@ -287,7 +269,6 @@ def alert(profile: dict, matched: list, volume: float, market_cap, created_at_ms
         f"24h Volume: ${volume:,.0f}\n"
         f"Market Cap: {mcap_str}\n"
         f"Token: {addr}\n"
-        f"{explorer_plain}"
         f"Summary: {desc}\n"
         f"{links_plain}"
         f"{url}"
@@ -296,7 +277,6 @@ def alert(profile: dict, matched: list, volume: float, market_cap, created_at_ms
 
     e = html.escape
     links_tg = "".join(f"{name}: {e(u)}\n" for name, u in links)
-    explorer_tg = f"Explorer: {e(explorer)}\n" if explorer else ""
     telegram_msg = (
         f"{header} on {e(chain.upper())}\n"
         f"Keywords: {e(', '.join(matched))}\n"
@@ -304,7 +284,6 @@ def alert(profile: dict, matched: list, volume: float, market_cap, created_at_ms
         f"24h Volume: ${volume:,.0f}\n"
         f"Market Cap: {e(mcap_str)}\n"
         f"Token (tap to copy): <code>{e(addr)}</code>\n"
-        f"{explorer_tg}"
         f"Summary: {e(desc)}\n"
         f"{links_tg}"
         f"{e(url)}"
@@ -351,8 +330,8 @@ def matched_keywords(description: str) -> list:
 
 
 def get_token_metrics(token_address: str):
-    """Return (volume_24h, market_cap, pair_created_at_ms) from the token's top
-    pair, or None on error. market_cap / created_at may be None if not reported.
+    """Return (volume_24h, market_cap, pair_created_at_ms, pair_url) from the
+    token's highest-volume pair, or None on error. Any field may be None.
     """
     try:
         resp = requests.get(
@@ -365,13 +344,14 @@ def get_token_metrics(token_address: str):
         resp.raise_for_status()
         pairs = resp.json().get("pairs") or []
         if not pairs:
-            return (0.0, None, None)
+            return (0.0, None, None, None)
         best = max(pairs, key=lambda p: float((p.get("volume") or {}).get("h24") or 0))
         volume = float((best.get("volume") or {}).get("h24") or 0)
         raw_mcap = best.get("marketCap")
         market_cap = float(raw_mcap) if raw_mcap is not None else None
         created_at = best.get("pairCreatedAt")
-        return (volume, market_cap, created_at)
+        pair_url = best.get("url")  # link to the pair that actually has the volume
+        return (volume, market_cap, created_at, pair_url)
     except (requests.RequestException, ValueError) as e:
         print(f"[warn] metrics lookup failed for {token_address}: {e}", flush=True)
         return None
@@ -467,7 +447,7 @@ def scan_once(seen: set) -> None:
             metrics = get_token_metrics(addr)
             if metrics is None:
                 continue
-            volume, market_cap, created_at = metrics
+            volume, market_cap, created_at, pair_url = metrics
 
             # Learning: record what we saw (any token, any size) for /topwords.
             if learn_on:
@@ -493,12 +473,12 @@ def scan_once(seen: set) -> None:
                 continue
 
             sort_age = age_h if age_h is not None else float("inf")
-            candidates.append((sort_age, key, p, hits, volume, market_cap, created_at))
+            candidates.append((sort_age, key, p, hits, volume, market_cap, created_at, pair_url))
             queued.add(key)
 
     candidates.sort(key=lambda c: c[0])  # youngest first
-    for _, key, p, hits, volume, market_cap, created_at in candidates:
-        alert(p, hits, volume, market_cap, created_at)
+    for _, key, p, hits, volume, market_cap, created_at, pair_url in candidates:
+        alert(p, hits, volume, market_cap, created_at, pair_url)
         seen.add(key)
 
     if CONFIG.get("learn_enabled"):
